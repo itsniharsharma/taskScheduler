@@ -15,6 +15,8 @@ export type DiaryTask = {
   reminderSent?: boolean;
   dueSent?: boolean;
   duePromptedAt?: string;
+  snoozeCount?: number;
+  rescheduleCount?: number;
   createdAt: string;
   updatedAt: string;
 };

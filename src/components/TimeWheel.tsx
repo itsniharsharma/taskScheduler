@@ -8,6 +8,7 @@ type TimeWheelProps = {
   tasks: DiaryTask[];
   previewColor?: string;
   scheduleMode?: boolean;
+  minScheduleMinutes?: number;
   scheduleAnchorMinutes?: number;
   scheduleDraftEndMinutes?: number;
   onDraftStartChange?: (startMinutes: number) => void;
@@ -89,6 +90,7 @@ export const TimeWheel = ({
   tasks,
   previewColor,
   scheduleMode = false,
+  minScheduleMinutes = 0,
   scheduleAnchorMinutes,
   scheduleDraftEndMinutes,
   onDraftStartChange,
@@ -147,7 +149,7 @@ export const TimeWheel = ({
     const y = event.clientY - bounds.top - bounds.height / 2;
     const deg = (Math.atan2(y, x) * 180) / Math.PI + 90;
     const target12 = angleToMinutes12(deg);
-    return clamp(chooseClosestHalfDay(target12, referenceMinutes24), 0, 1439);
+    return clamp(chooseClosestHalfDay(target12, referenceMinutes24), minScheduleMinutes, 1439);
   };
 
   const endPointerInteraction = (event: React.PointerEvent<SVGElement>) => {
@@ -224,7 +226,7 @@ export const TimeWheel = ({
                 const proposed = getPointerMinutes(event, lastPointerMinutes);
                 const delta = normalizeDelta(proposed, lastPointerMinutes);
                 const duration = previewEnd - previewStart;
-                const nextStart = clamp(previewStart + delta, 0, 1439 - duration);
+                const nextStart = clamp(previewStart + delta, minScheduleMinutes, 1439 - duration);
                 const nextEnd = nextStart + duration;
                 onDraftRangeChange?.(nextStart, nextEnd);
                 setLastPointerMinutes(proposed);
@@ -249,7 +251,7 @@ export const TimeWheel = ({
                 event.preventDefault();
                 event.stopPropagation();
                 const proposed = getPointerMinutes(event, previewStart);
-                onDraftStartChange?.(Math.min(proposed, previewEnd - 10));
+                onDraftStartChange?.(Math.max(minScheduleMinutes, Math.min(proposed, previewEnd - 10)));
               }}
               onPointerUp={endPointerInteraction}
               onPointerCancel={endPointerInteraction}

@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { addMinutes, format, parseISO, subMinutes } from "date-fns";
+import { AnalyticsPanel } from "./components/AnalyticsPanel";
 import { DiaryTaskList } from "./components/DiaryTaskList";
+import { NotesPanel } from "./components/NotesPanel";
 import { TaskComposer } from "./components/TaskComposer";
 import { TimeWheel } from "./components/TimeWheel";
 import {
@@ -12,7 +14,8 @@ import {
   toHHMM,
   toMinutes
 } from "./lib/productivity";
-import { loadTasks, saveTasks } from "./lib/storage";
+import { loadAppData, saveAppData } from "./lib/storage";
+import type { AppData, CompletionResponse } from "./types/appData";
 import type { DiaryTask, ReminderLead } from "./types/task";
 
 const reminderLeadMinutes: Record<ReminderLead, number> = {
@@ -67,18 +70,16 @@ const assignScheduledTaskColors = (inputTasks: DiaryTask[]): DiaryTask[] => {
 
 const createId = () => `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 const isScheduled = (task: DiaryTask) => Boolean(task.startTime && task.endTime);
-
-const loadTasksWithColorMigration = () => {
-  const loaded = loadTasks();
-  const migrated = assignScheduledTaskColors(loaded);
-  if (migrated !== loaded) {
-    saveTasks(migrated);
-  }
-  return migrated;
-};
+type SectionTab = "diary" | "notes" | "analytics";
+const minScheduleDuration = 10;
 
 const App = () => {
-  const [tasks, setTasks] = useState<DiaryTask[]>(() => loadTasksWithColorMigration());
+  const [tasks, setTasks] = useState<DiaryTask[]>([]);
+  const [notesByDate, setNotesByDate] = useState<AppData["notesByDate"]>({});
+  const [completionResponses, setCompletionResponses] = useState<CompletionResponse[]>([]);
+  const [storagePath, setStoragePath] = useState("");
+  const [activeTab, setActiveTab] = useState<SectionTab>("diary");
+  const [hydrated, setHydrated] = useState(false);
   const [selectedDayKey, setSelectedDayKey] = useState(getTodayKey());
   const [now, setNow] = useState(new Date());
   const [pageFlip, setPageFlip] = useState(false);
@@ -91,14 +92,78 @@ const App = () => {
   const [scheduleAnchorMinutes, setScheduleAnchorMinutes] = useState<number | null>(null);
   const [scheduleDraftEndMinutes, setScheduleDraftEndMinutes] = useState<number | null>(null);
   const [scheduleReminderLead, setScheduleReminderLead] = useState<ReminderLead>("15m");
+  const [noteDraft, setNoteDraft] = useState("");
   const previousDayRef = useRef(selectedDayKey);
+  const noteAutosaveTimer = useRef<number | null>(null);
 
-  const syncTasks = (updater: (prev: DiaryTask[]) => DiaryTask[]) => {
-    setTasks((prev) => {
-      const next = assignScheduledTaskColors(updater(prev));
-      saveTasks(next);
-      return next;
-    });
+  useEffect(() => {
+    void (async () => {
+      const data = await loadAppData();
+      setTasks(assignScheduledTaskColors(data.tasks));
+      setNotesByDate(data.notesByDate);
+      setCompletionResponses(data.completionResponses ?? []);
+      setStoragePath(data.settings.storagePath);
+      setHydrated(true);
+    })();
+  }, []);
+
+  useEffect(() => {
+    setNoteDraft(notesByDate[selectedDayKey]?.content ?? "");
+  }, [notesByDate, selectedDayKey]);
+
+  useEffect(() => {
+    if (!hydrated) return;
+    if (noteAutosaveTimer.current) {
+      window.clearTimeout(noteAutosaveTimer.current);
+    }
+    noteAutosaveTimer.current = window.setTimeout(() => {
+      setNotesByDate((prev) => ({
+        ...prev,
+        [selectedDayKey]: {
+          content: noteDraft,
+          updatedAt: new Date().toISOString()
+        }
+      }));
+    }, 260);
+    return () => {
+      if (noteAutosaveTimer.current) {
+        window.clearTimeout(noteAutosaveTimer.current);
+      }
+    };
+  }, [hydrated, noteDraft, selectedDayKey]);
+
+  useEffect(() => {
+    if (!hydrated) return;
+    const payload: AppData = {
+      version: 1,
+      tasks,
+      notesByDate,
+      completionResponses,
+      settings: {
+        storagePath,
+        initializedAt: new Date().toISOString()
+      }
+    };
+    void saveAppData(payload);
+  }, [completionResponses, hydrated, notesByDate, storagePath, tasks]);
+
+  const syncTasks = (updater: (prev: DiaryTask[]) => DiaryTask[]) =>
+    setTasks((prev) => assignScheduledTaskColors(updater(prev)));
+
+  const recordCompletionResponse = (task: DiaryTask, response: "YES" | "NO") => {
+    if (!task.startTime || !task.endTime) return;
+    setCompletionResponses((prev) => [
+      ...prev,
+      {
+        id: createId(),
+        taskId: task.id,
+        scheduledDate: task.date,
+        scheduledStart: task.startTime,
+        scheduledEnd: task.endTime,
+        response,
+        respondedAt: new Date().toISOString()
+      }
+    ]);
   };
 
   const triggerPageFlip = () => {
@@ -125,11 +190,7 @@ const App = () => {
             return task;
           }
 
-          const [startH, startM] = task.startTime.split(":").map(Number);
           const [endH, endM] = task.endTime.split(":").map(Number);
-
-          const startAt = new Date(nextNow);
-          startAt.setHours(startH, startM, 0, 0);
 
           const endAt = new Date(nextNow);
           endAt.setHours(endH, endM, 0, 0);
@@ -170,7 +231,6 @@ const App = () => {
         });
 
         if (changed) {
-          saveTasks(next);
           return next;
         }
         return prev;
@@ -204,6 +264,8 @@ const App = () => {
 
   const diaryDate = parseISO(selectedDayKey);
   const duePromptTask = tasks.find((task) => task.id === duePromptTaskId) ?? null;
+  const nowMinutes = now.getHours() * 60 + now.getMinutes();
+  const schedulingLowerBound = selectedDayKey === getTodayKey() ? nowMinutes : 0;
 
   const moveDay = (delta: number) => {
     const base = parseISO(selectedDayKey);
@@ -215,9 +277,13 @@ const App = () => {
 
   const setTaskAsActiveSchedule = (task: DiaryTask) => {
     const realtimeNow = new Date();
+    const lowerBound =
+      selectedDayKey === getTodayKey() ? realtimeNow.getHours() * 60 + realtimeNow.getMinutes() : 0;
     const hasSavedRange = Boolean(task.startTime && task.endTime);
-    const anchor = hasSavedRange ? toMinutes(task.startTime!) : realtimeNow.getHours() * 60 + realtimeNow.getMinutes();
-    const draftEnd = hasSavedRange ? toMinutes(task.endTime!) : Math.min(1439, anchor + 60);
+    const rawAnchor = hasSavedRange ? toMinutes(task.startTime!) : lowerBound;
+    const anchor = Math.max(lowerBound, rawAnchor);
+    const rawEnd = hasSavedRange ? toMinutes(task.endTime!) : Math.min(1439, anchor + 60);
+    const draftEnd = Math.max(anchor + minScheduleDuration, rawEnd);
     setActiveScheduleTaskId(task.id);
     setScheduleAnchorMinutes(anchor);
     setScheduleDraftEndMinutes(draftEnd);
@@ -235,6 +301,8 @@ const App = () => {
 
   const saveActiveSchedule = () => {
     if (!activeScheduleTaskId || scheduleAnchorMinutes === null || scheduleDraftEndMinutes === null) return;
+    const safeStart = Math.max(schedulingLowerBound, scheduleAnchorMinutes);
+    const safeEnd = Math.max(safeStart + minScheduleDuration, scheduleDraftEndMinutes);
 
     const alertLeadMinutes =
       scheduleReminderLead === "none" ? 0 : reminderLeadMinutes[scheduleReminderLead];
@@ -244,8 +312,8 @@ const App = () => {
         task.id === activeScheduleTaskId
           ? {
               ...task,
-              startTime: toHHMM(scheduleAnchorMinutes),
-              endTime: toHHMM(scheduleDraftEndMinutes),
+              startTime: toHHMM(safeStart),
+              endTime: toHHMM(Math.min(1439, safeEnd)),
               color: task.color ?? pickTaskColor(prev.map((item) => item.color ?? "")),
               reminderLead: scheduleReminderLead,
               alertLeadMinutes,
@@ -268,6 +336,35 @@ const App = () => {
   return (
     <main className="widget-shell diary-shell">
       <div className="widget-drag-strip drag-region" />
+      <div className="top-section-tabs top-section-tabs-header">
+        <button
+          type="button"
+          className={`top-section-tab ${activeTab === "diary" ? "top-section-tab-active" : ""}`}
+          onClick={() => setActiveTab("diary")}
+        >
+          Diary
+        </button>
+        <button
+          type="button"
+          className={`top-section-tab ${activeTab === "notes" ? "top-section-tab-active" : ""}`}
+          onClick={() => {
+            setScheduleMode(false);
+            setActiveTab("notes");
+          }}
+        >
+          Notes
+        </button>
+        <button
+          type="button"
+          className={`top-section-tab ${activeTab === "analytics" ? "top-section-tab-active" : ""}`}
+          onClick={() => {
+            setScheduleMode(false);
+            setActiveTab("analytics");
+          }}
+        >
+          Analytics
+        </button>
+      </div>
       <TimeWheel
         now={now}
         tasks={scheduledTasks}
@@ -275,11 +372,20 @@ const App = () => {
         scheduleMode={scheduleMode && Boolean(activeScheduleTask)}
         scheduleAnchorMinutes={scheduleAnchorMinutes ?? undefined}
         scheduleDraftEndMinutes={scheduleDraftEndMinutes ?? undefined}
-        onDraftStartChange={setScheduleAnchorMinutes}
-        onDraftEndChange={setScheduleDraftEndMinutes}
+        minScheduleMinutes={schedulingLowerBound}
+        onDraftStartChange={(nextStart) =>
+          setScheduleAnchorMinutes(Math.max(schedulingLowerBound, nextStart))
+        }
+        onDraftEndChange={(nextEnd) =>
+          setScheduleDraftEndMinutes(() => {
+            const anchor = scheduleAnchorMinutes ?? schedulingLowerBound;
+            return Math.max(anchor + minScheduleDuration, nextEnd);
+          })
+        }
         onDraftRangeChange={(startMinutes, endMinutes) => {
-          setScheduleAnchorMinutes(startMinutes);
-          setScheduleDraftEndMinutes(endMinutes);
+          const clampedStart = Math.max(schedulingLowerBound, startMinutes);
+          setScheduleAnchorMinutes(clampedStart);
+          setScheduleDraftEndMinutes(Math.max(clampedStart + minScheduleDuration, endMinutes));
         }}
       />
 
@@ -298,7 +404,7 @@ const App = () => {
             <p className="diary-subtle">{getQuote()}</p>
           </header>
 
-          {scheduleMode ? (
+          {activeTab === "diary" && scheduleMode ? (
             <section className="schedule-workspace">
               <div className="schedule-panel-top">
                 <h3>Schedule Day</h3>
@@ -371,26 +477,27 @@ const App = () => {
                 </div>
               </div>
             </section>
-          ) : (
+          ) : activeTab === "diary" ? (
             <>
               <TaskComposer
                 date={selectedDayKey}
                 onCreateTask={(input) => {
                   const timestamp = new Date().toISOString();
+                  const newTask: DiaryTask = {
+                    id: createId(),
+                    createdAt: timestamp,
+                    updatedAt: timestamp,
+                    status: "pending",
+                    reminderLead: "none",
+                    alertLeadMinutes: 15,
+                    alarmEnabled: false,
+                    reminderSent: false,
+                    dueSent: false,
+                    ...input
+                  };
                   syncTasks((prev) => [
                     ...prev,
-                    {
-                      id: createId(),
-                      createdAt: timestamp,
-                      updatedAt: timestamp,
-                      status: "pending",
-                      reminderLead: "none",
-                      alertLeadMinutes: 15,
-                      alarmEnabled: false,
-                      reminderSent: false,
-                      dueSent: false,
-                      ...input
-                    }
+                    newTask
                   ]);
                 }}
               />
@@ -422,9 +529,14 @@ const App = () => {
                 />
               </div>
             </>
+          ) : activeTab === "notes" ? (
+            <NotesPanel dateLabel={getDiaryHeading(diaryDate)} value={noteDraft} onChange={setNoteDraft} />
+          ) : (
+            <AnalyticsPanel responses={completionResponses} now={now} />
           )}
-
-          <p className="diary-archive-note">Capture first. Enter schedule mode to map tasks onto your day.</p>
+          {activeTab === "diary" && (
+            <p className="diary-archive-note">Capture first. Enter schedule mode to map tasks onto your day.</p>
+          )}
         </div>
       </section>
 
@@ -450,6 +562,7 @@ const App = () => {
                         : task
                     )
                   );
+                  recordCompletionResponse(duePromptTask, "YES");
                   setDuePromptTaskId(null);
                 }}
               >
@@ -469,12 +582,14 @@ const App = () => {
                       return {
                         ...task,
                         endTime: format(shifted, "HH:mm"),
+                        snoozeCount: (task.snoozeCount ?? 0) + 1,
                         dueSent: false,
                         duePromptedAt: undefined,
                         updatedAt: new Date().toISOString()
                       };
                     })
                   );
+                  recordCompletionResponse(duePromptTask, "NO");
                   setDuePromptTaskId(null);
                 }}
               >
@@ -508,6 +623,7 @@ const App = () => {
                         ? {
                             ...task,
                             endTime: rescheduleTime,
+                            rescheduleCount: (task.rescheduleCount ?? 0) + 1,
                             dueSent: false,
                             duePromptedAt: undefined,
                             updatedAt: new Date().toISOString()
@@ -515,6 +631,7 @@ const App = () => {
                         : task
                     )
                   );
+                  recordCompletionResponse(duePromptTask, "NO");
                   setDuePromptTaskId(null);
                 }}
               >

@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, Notification, screen } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, Notification, screen } from "electron";
 import path from "node:path";
 import fs from "node:fs";
 
@@ -8,6 +8,27 @@ type AppConfig = {
   pinned: boolean;
   launchOnStartup: boolean;
   bounds?: WindowBounds;
+  dataDirectory?: string;
+};
+
+type StoredAppData = {
+  version: 1;
+  tasks: unknown[];
+  notesByDate: Record<string, { content: string; updatedAt: string }>;
+  completionResponses: Array<{
+    id: string;
+    taskId: string;
+    scheduledDate: string;
+    scheduledStart: string;
+    scheduledEnd: string;
+    response: "YES" | "NO";
+    respondedAt: string;
+  }>;
+  analyticsEvents?: unknown[];
+  settings: {
+    storagePath: string;
+    initializedAt: string;
+  };
 };
 
 const isDev = process.env.NODE_ENV === "development";
@@ -38,6 +59,17 @@ const defaultConfig: AppConfig = {
   launchOnStartup: true
 };
 
+const defaultStoredData = (storagePath: string): StoredAppData => ({
+  version: 1,
+  tasks: [],
+  notesByDate: {},
+  completionResponses: [],
+  settings: {
+    storagePath,
+    initializedAt: new Date().toISOString()
+  }
+});
+
 const readConfig = (): AppConfig => {
   try {
     if (!fs.existsSync(configPath)) {
@@ -52,6 +84,59 @@ const readConfig = (): AppConfig => {
 
 const writeConfig = (nextConfig: AppConfig): void => {
   fs.writeFileSync(configPath, JSON.stringify(nextConfig, null, 2), "utf8");
+};
+
+const resolveStorageDirectory = async (): Promise<string> => {
+  const cfg = readConfig();
+  if (cfg.dataDirectory && fs.existsSync(cfg.dataDirectory)) {
+    return cfg.dataDirectory;
+  }
+
+  const suggested = path.join(app.getPath("appData"), "DesktopPlanWidgetData");
+  const selection = await dialog.showOpenDialog({
+    title: "Select storage folder for Desktop Plan Widget data",
+    defaultPath: suggested,
+    properties: ["openDirectory", "createDirectory"]
+  });
+
+  const selectedPath = selection.canceled ? suggested : selection.filePaths[0] ?? suggested;
+  fs.mkdirSync(selectedPath, { recursive: true });
+  writeConfig({ ...cfg, dataDirectory: selectedPath });
+  return selectedPath;
+};
+
+const getDataFilePath = async () => {
+  const dataDir = await resolveStorageDirectory();
+  return path.join(dataDir, "app-data.json");
+};
+
+const readStoredAppData = async (): Promise<StoredAppData> => {
+  const filePath = await getDataFilePath();
+  const cfg = readConfig();
+  const storagePath = cfg.dataDirectory ?? path.dirname(filePath);
+  const fallback = defaultStoredData(storagePath);
+  try {
+    if (!fs.existsSync(filePath)) {
+      fs.writeFileSync(filePath, JSON.stringify(fallback, null, 2), "utf8");
+      return fallback;
+    }
+    const raw = fs.readFileSync(filePath, "utf8");
+    const parsed = JSON.parse(raw) as Partial<StoredAppData>;
+    return {
+      ...fallback,
+      ...parsed,
+      settings: { ...fallback.settings, ...parsed.settings, storagePath }
+    };
+  } catch {
+    return fallback;
+  }
+};
+
+const writeStoredAppData = async (nextData: StoredAppData): Promise<void> => {
+  const filePath = await getDataFilePath();
+  const tempPath = `${filePath}.tmp`;
+  fs.writeFileSync(tempPath, JSON.stringify(nextData, null, 2), "utf8");
+  fs.renameSync(tempPath, filePath);
 };
 
 const getCenteredBounds = (): WindowBounds => {
@@ -170,10 +255,21 @@ const setupIpc = (): void => {
       });
     }
   );
+
+  ipcMain.handle("data:load", async () => readStoredAppData());
+  ipcMain.handle("data:save", async (_event, payload: StoredAppData) => {
+    await writeStoredAppData(payload);
+  });
+  ipcMain.handle("data:get-storage-info", async () => {
+    const storagePath = await resolveStorageDirectory();
+    return { storagePath };
+  });
 };
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
   ensureSessionDataPath();
+  await resolveStorageDirectory();
+  await readStoredAppData();
   const cfg = readConfig();
 
   app.setLoginItemSettings({
