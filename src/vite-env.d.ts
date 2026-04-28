@@ -14,6 +14,8 @@ declare global {
       loadAppData: () => Promise<AppData>;
       saveAppData: (data: AppData) => Promise<void>;
       getStorageInfo: () => Promise<{ storagePath: string }>;
+      getPingSoundPath: () => Promise<{ path: string | null }>;
+      playSystemBeep: () => Promise<void>;
     };
   }
 }

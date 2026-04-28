@@ -19,10 +19,11 @@ type AppData = {
     response: "YES" | "NO";
     respondedAt: string;
   }>;
-  analyticsEvents?: unknown[];
   settings: {
     storagePath: string;
     initializedAt: string;
+    pingOnReminder: boolean;
+    pingOnCompletion: boolean;
   };
 };
 
@@ -35,7 +36,9 @@ const api = {
     ipcRenderer.send("notifications:show", payload),
   loadAppData: () => ipcRenderer.invoke("data:load") as Promise<AppData>,
   saveAppData: (data: AppData) => ipcRenderer.invoke("data:save", data),
-  getStorageInfo: () => ipcRenderer.invoke("data:get-storage-info") as Promise<{ storagePath: string }>
+  getStorageInfo: () => ipcRenderer.invoke("data:get-storage-info") as Promise<{ storagePath: string }>,
+  getPingSoundPath: () => ipcRenderer.invoke("sound:get-ping-path") as Promise<{ path: string | null }>,
+  playSystemBeep: () => ipcRenderer.invoke("sound:play-system-beep") as Promise<void>
 };
 
 contextBridge.exposeInMainWorld("desktopWidget", api);

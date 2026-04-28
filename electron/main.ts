@@ -1,8 +1,9 @@
-import { app, BrowserWindow, dialog, ipcMain, Notification, screen } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, Notification, screen, shell } from "electron";
 import path from "node:path";
 import fs from "node:fs";
 
 type WindowBounds = { x: number; y: number; width: number; height: number };
+const FIXED_WIDGET_SIZE = { width: 399, height: 725 } as const;
 
 type AppConfig = {
   pinned: boolean;
@@ -24,10 +25,11 @@ type StoredAppData = {
     response: "YES" | "NO";
     respondedAt: string;
   }>;
-  analyticsEvents?: unknown[];
   settings: {
     storagePath: string;
     initializedAt: string;
+    pingOnReminder: boolean;
+    pingOnCompletion: boolean;
   };
 };
 
@@ -66,9 +68,23 @@ const defaultStoredData = (storagePath: string): StoredAppData => ({
   completionResponses: [],
   settings: {
     storagePath,
-    initializedAt: new Date().toISOString()
+    initializedAt: new Date().toISOString(),
+    pingOnReminder: true,
+    pingOnCompletion: true
   }
 });
+
+const resolvePingSoundPath = (): string | null => {
+  const candidates = [
+    path.join(process.cwd(), "sound", "sound.mp3"),
+    path.join(app.getAppPath(), "sound", "sound.mp3"),
+    path.join(path.dirname(app.getPath("exe")), "sound", "sound.mp3")
+  ];
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) return candidate;
+  }
+  return null;
+};
 
 const readConfig = (): AppConfig => {
   try {
@@ -121,10 +137,16 @@ const readStoredAppData = async (): Promise<StoredAppData> => {
       return fallback;
     }
     const raw = fs.readFileSync(filePath, "utf8");
-    const parsed = JSON.parse(raw) as Partial<StoredAppData>;
+    const parsed = JSON.parse(raw) as Partial<StoredAppData> & { analyticsEvents?: unknown[] };
+    const migratedResponses =
+      parsed.completionResponses ??
+      (Array.isArray(parsed.analyticsEvents)
+        ? []
+        : []);
     return {
       ...fallback,
       ...parsed,
+      completionResponses: Array.isArray(migratedResponses) ? migratedResponses : [],
       settings: { ...fallback.settings, ...parsed.settings, storagePath }
     };
   } catch {
@@ -139,11 +161,11 @@ const writeStoredAppData = async (nextData: StoredAppData): Promise<void> => {
   fs.renameSync(tempPath, filePath);
 };
 
-const getCenteredBounds = (): WindowBounds => {
-  const fallback: WindowBounds = { width: 420, height: 700, x: 0, y: 0 };
+const getDefaultWidgetBounds = (): WindowBounds => {
+  const fallback: WindowBounds = { width: FIXED_WIDGET_SIZE.width, height: FIXED_WIDGET_SIZE.height, x: 0, y: 0 };
   const primary = screen.getPrimaryDisplay().workArea;
-  const width = Math.max(360, Math.min(fallback.width, primary.width));
-  const height = Math.max(540, Math.min(fallback.height, primary.height));
+  const width = Math.min(fallback.width, primary.width);
+  const height = Math.min(fallback.height, primary.height);
   return {
     width,
     height,
@@ -155,12 +177,22 @@ const getCenteredBounds = (): WindowBounds => {
 
 const createMainWindow = (): void => {
   const cfg = readConfig();
-  const bounds = cfg.bounds ?? getCenteredBounds();
+  const defaults = getDefaultWidgetBounds();
+  const bounds: WindowBounds = {
+    width: FIXED_WIDGET_SIZE.width,
+    height: FIXED_WIDGET_SIZE.height,
+    x: cfg.bounds?.x ?? defaults.x,
+    y: cfg.bounds?.y ?? defaults.y
+  };
   mainWindow = new BrowserWindow({
     ...bounds,
     show: true,
-    minWidth: 360,
-    minHeight: 540,
+    minWidth: FIXED_WIDGET_SIZE.width,
+    minHeight: FIXED_WIDGET_SIZE.height,
+    width: FIXED_WIDGET_SIZE.width,
+    height: FIXED_WIDGET_SIZE.height,
+    maxWidth: FIXED_WIDGET_SIZE.width,
+    maxHeight: FIXED_WIDGET_SIZE.height,
     frame: false,
     transparent: true,
     title: "Desktop Plan Widget",
@@ -168,7 +200,9 @@ const createMainWindow = (): void => {
     backgroundColor: "#00000000",
     roundedCorners: true,
     hasShadow: true,
-    resizable: true,
+    resizable: false,
+    maximizable: false,
+    fullscreenable: false,
     skipTaskbar: true,
     alwaysOnTop: cfg.pinned,
     webPreferences: {
@@ -203,14 +237,22 @@ const createMainWindow = (): void => {
     mainWindow.loadFile(path.join(__dirname, "..", "dist", "index.html"));
   }
 
-  const persistBounds = () => {
+  const persistPosition = () => {
     if (!mainWindow) return;
     const cfg = readConfig();
-    writeConfig({ ...cfg, bounds: mainWindow.getBounds() });
+    const position = mainWindow.getPosition();
+    writeConfig({
+      ...cfg,
+      bounds: {
+        width: FIXED_WIDGET_SIZE.width,
+        height: FIXED_WIDGET_SIZE.height,
+        x: position[0],
+        y: position[1]
+      }
+    });
   };
 
-  mainWindow.on("move", persistBounds);
-  mainWindow.on("resize", persistBounds);
+  mainWindow.on("move", persistPosition);
 
   if (cfg.pinned) {
     mainWindow.setAlwaysOnTop(true, "screen-saver");
@@ -263,6 +305,10 @@ const setupIpc = (): void => {
   ipcMain.handle("data:get-storage-info", async () => {
     const storagePath = await resolveStorageDirectory();
     return { storagePath };
+  });
+  ipcMain.handle("sound:get-ping-path", () => ({ path: resolvePingSoundPath() }));
+  ipcMain.handle("sound:play-system-beep", () => {
+    shell.beep();
   });
 };
 

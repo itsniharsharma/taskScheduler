@@ -10,9 +10,37 @@ const defaultAppData = (storagePath = ""): AppData => ({
   completionResponses: [],
   settings: {
     storagePath,
-    initializedAt: new Date().toISOString()
+    initializedAt: new Date().toISOString(),
+    pingOnReminder: true,
+    pingOnCompletion: true
   }
 });
+
+const normalizeTask = (task: DiaryTask): DiaryTask => ({
+  ...task,
+  reminderLead: task.reminderLead ?? "none",
+  status: task.status ?? "pending",
+  createdAt: task.createdAt ?? new Date().toISOString(),
+  updatedAt: task.updatedAt ?? new Date().toISOString()
+});
+
+const normalizeAppData = (input: AppData, storagePath: string): AppData => {
+  const safeTasks = Array.isArray(input.tasks) ? input.tasks.map(normalizeTask) : [];
+  const safeNotes = input.notesByDate && typeof input.notesByDate === "object" ? input.notesByDate : {};
+  const safeResponses = Array.isArray(input.completionResponses) ? input.completionResponses : [];
+  return {
+    ...defaultAppData(storagePath),
+    ...input,
+    tasks: safeTasks,
+    notesByDate: safeNotes,
+    completionResponses: safeResponses,
+    settings: {
+      ...defaultAppData(storagePath).settings,
+      ...input.settings,
+      storagePath
+    }
+  };
+};
 
 const loadLegacyTasks = (): DiaryTask[] => {
   try {
@@ -29,15 +57,7 @@ export const loadAppData = async (): Promise<AppData> => {
   try {
     const storageInfo = await window.desktopWidget.getStorageInfo();
     const loaded = await window.desktopWidget.loadAppData();
-    const normalized: AppData = {
-      ...defaultAppData(storageInfo.storagePath),
-      ...loaded,
-      settings: {
-        ...defaultAppData(storageInfo.storagePath).settings,
-        ...loaded.settings,
-        storagePath: storageInfo.storagePath
-      }
-    };
+    const normalized = normalizeAppData(loaded, storageInfo.storagePath);
     if (!normalized.tasks.length) {
       const legacy = loadLegacyTasks();
       if (legacy.length) {
@@ -51,5 +71,7 @@ export const loadAppData = async (): Promise<AppData> => {
 };
 
 export const saveAppData = async (data: AppData): Promise<void> => {
-  await window.desktopWidget.saveAppData(data);
+  await window.desktopWidget.saveAppData(
+    normalizeAppData(data, data.settings?.storagePath ?? "")
+  );
 };

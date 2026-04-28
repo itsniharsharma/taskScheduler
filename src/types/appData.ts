@@ -20,9 +20,10 @@ export type AppData = {
   tasks: DiaryTask[];
   notesByDate: Record<string, DayNote>;
   completionResponses: CompletionResponse[];
-  analyticsEvents?: unknown[];
   settings: {
     storagePath: string;
     initializedAt: string;
+    pingOnReminder: boolean;
+    pingOnCompletion: boolean;
   };
 };

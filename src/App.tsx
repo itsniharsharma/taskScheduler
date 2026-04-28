@@ -1,15 +1,14 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { addMinutes, format, parseISO, subMinutes } from "date-fns";
+import { format, parseISO, subMinutes } from "date-fns";
 import { AnalyticsPanel } from "./components/AnalyticsPanel";
 import { DiaryTaskList } from "./components/DiaryTaskList";
 import { NotesPanel } from "./components/NotesPanel";
+import { SchedulingPanel } from "./components/SchedulingPanel";
 import { TaskComposer } from "./components/TaskComposer";
 import { TimeWheel } from "./components/TimeWheel";
 import {
   getDiaryHeading,
-  getQuote,
   getTodayKey,
-  minutesTo12HourTime,
   to12HourTime,
   toHHMM,
   toMinutes
@@ -78,14 +77,16 @@ const App = () => {
   const [notesByDate, setNotesByDate] = useState<AppData["notesByDate"]>({});
   const [completionResponses, setCompletionResponses] = useState<CompletionResponse[]>([]);
   const [storagePath, setStoragePath] = useState("");
+  const [initializedAt, setInitializedAt] = useState(() => new Date().toISOString());
+  const [pingOnReminder, setPingOnReminder] = useState(true);
+  const [pingOnCompletion, setPingOnCompletion] = useState(true);
   const [activeTab, setActiveTab] = useState<SectionTab>("diary");
+  const [showSoundSettings, setShowSoundSettings] = useState(false);
   const [hydrated, setHydrated] = useState(false);
   const [selectedDayKey, setSelectedDayKey] = useState(getTodayKey());
   const [now, setNow] = useState(new Date());
   const [pageFlip, setPageFlip] = useState(false);
   const [duePromptTaskId, setDuePromptTaskId] = useState<string | null>(null);
-  const [snoozeMinutes, setSnoozeMinutes] = useState(10);
-  const [rescheduleTime, setRescheduleTime] = useState("18:00");
   const [scheduleMode, setScheduleMode] = useState(false);
   const [activeScheduleTaskId, setActiveScheduleTaskId] = useState<string | null>(null);
   const [alarmEnabled, setAlarmEnabled] = useState(false);
@@ -95,6 +96,9 @@ const App = () => {
   const [noteDraft, setNoteDraft] = useState("");
   const previousDayRef = useRef(selectedDayKey);
   const noteAutosaveTimer = useRef<number | null>(null);
+  const persistTimer = useRef<number | null>(null);
+  const lastPersistedSnapshot = useRef("");
+  const pingAudioRef = useRef<HTMLAudioElement | null>(null);
 
   useEffect(() => {
     void (async () => {
@@ -103,6 +107,14 @@ const App = () => {
       setNotesByDate(data.notesByDate);
       setCompletionResponses(data.completionResponses ?? []);
       setStoragePath(data.settings.storagePath);
+      setInitializedAt(data.settings.initializedAt ?? new Date().toISOString());
+      setPingOnReminder(data.settings.pingOnReminder ?? true);
+      setPingOnCompletion(data.settings.pingOnCompletion ?? true);
+      const pingMeta = await window.desktopWidget.getPingSoundPath();
+      if (pingMeta.path) {
+        const src = `file:///${pingMeta.path.replace(/\\/g, "/")}`;
+        pingAudioRef.current = new Audio(src);
+      }
       setHydrated(true);
     })();
   }, []);
@@ -117,13 +129,17 @@ const App = () => {
       window.clearTimeout(noteAutosaveTimer.current);
     }
     noteAutosaveTimer.current = window.setTimeout(() => {
-      setNotesByDate((prev) => ({
-        ...prev,
-        [selectedDayKey]: {
-          content: noteDraft,
-          updatedAt: new Date().toISOString()
-        }
-      }));
+      setNotesByDate((prev) => {
+        const existing = prev[selectedDayKey];
+        if ((existing?.content ?? "") === noteDraft) return prev;
+        return {
+          ...prev,
+          [selectedDayKey]: {
+            content: noteDraft,
+            updatedAt: new Date().toISOString()
+          }
+        };
+      });
     }, 260);
     return () => {
       if (noteAutosaveTimer.current) {
@@ -141,11 +157,40 @@ const App = () => {
       completionResponses,
       settings: {
         storagePath,
-        initializedAt: new Date().toISOString()
+        initializedAt,
+        pingOnReminder,
+        pingOnCompletion
       }
     };
-    void saveAppData(payload);
-  }, [completionResponses, hydrated, notesByDate, storagePath, tasks]);
+    const snapshot = JSON.stringify(payload);
+    if (snapshot === lastPersistedSnapshot.current) return;
+
+    if (persistTimer.current) {
+      window.clearTimeout(persistTimer.current);
+    }
+    persistTimer.current = window.setTimeout(() => {
+      lastPersistedSnapshot.current = snapshot;
+      void saveAppData(payload);
+    }, 180);
+
+    return () => {
+      if (persistTimer.current) {
+        window.clearTimeout(persistTimer.current);
+      }
+    };
+  }, [completionResponses, hydrated, initializedAt, notesByDate, pingOnCompletion, pingOnReminder, storagePath, tasks]);
+
+  const playPing = () => {
+    const audio = pingAudioRef.current;
+    if (!audio) {
+      void window.desktopWidget.playSystemBeep();
+      return;
+    }
+    audio.currentTime = 0;
+    void audio.play().catch(() => {
+      void window.desktopWidget.playSystemBeep();
+    });
+  };
 
   const syncTasks = (updater: (prev: DiaryTask[]) => DiaryTask[]) =>
     setTasks((prev) => assignScheduledTaskColors(updater(prev)));
@@ -203,6 +248,9 @@ const App = () => {
           let nextTask = task;
 
           if (!task.reminderSent && nextNow >= remindAt) {
+            if (pingOnReminder) {
+              playPing();
+            }
             window.desktopWidget.showNotification({
               title: "Diary reminder",
               body: `${task.title} ends at ${to12HourTime(task.endTime)}`,
@@ -212,6 +260,9 @@ const App = () => {
           }
 
           if (!nextTask.dueSent && nextNow >= endAt) {
+            if (pingOnCompletion) {
+              playPing();
+            }
             window.desktopWidget.showNotification({
               title: "Time block ended",
               body: `${task.title} ended at ${to12HourTime(task.endTime)}`
@@ -223,7 +274,6 @@ const App = () => {
               updatedAt: nextNow.toISOString()
             };
             setDuePromptTaskId(task.id);
-            setRescheduleTime(task.endTime);
           }
 
           if (nextTask !== task) changed = true;
@@ -282,8 +332,8 @@ const App = () => {
     const hasSavedRange = Boolean(task.startTime && task.endTime);
     const rawAnchor = hasSavedRange ? toMinutes(task.startTime!) : lowerBound;
     const anchor = Math.max(lowerBound, rawAnchor);
-    const rawEnd = hasSavedRange ? toMinutes(task.endTime!) : Math.min(1439, anchor + 60);
-    const draftEnd = Math.max(anchor + minScheduleDuration, rawEnd);
+    const rawEnd = hasSavedRange ? toMinutes(task.endTime!) : anchor;
+    const draftEnd = hasSavedRange ? Math.max(anchor + minScheduleDuration, rawEnd) : anchor;
     setActiveScheduleTaskId(task.id);
     setScheduleAnchorMinutes(anchor);
     setScheduleDraftEndMinutes(draftEnd);
@@ -336,7 +386,8 @@ const App = () => {
   return (
     <main className="widget-shell diary-shell">
       <div className="widget-drag-strip drag-region" />
-      <div className="top-section-tabs top-section-tabs-header">
+      <div className="top-nav-shell">
+        <div className="top-section-tabs top-section-tabs-header">
         <button
           type="button"
           className={`top-section-tab ${activeTab === "diary" ? "top-section-tab-active" : ""}`}
@@ -364,6 +415,35 @@ const App = () => {
         >
           Analytics
         </button>
+        </div>
+        <button
+          type="button"
+          className="top-settings-btn"
+          aria-label="Sound settings"
+          onClick={() => setShowSoundSettings((prev) => !prev)}
+        >
+          ⚙
+        </button>
+        {showSoundSettings && (
+          <div className="top-settings-popover">
+            <label>
+              <input
+                type="checkbox"
+                checked={pingOnReminder}
+                onChange={(event) => setPingOnReminder(event.target.checked)}
+              />
+              Ping on reminder
+            </label>
+            <label>
+              <input
+                type="checkbox"
+                checked={pingOnCompletion}
+                onChange={(event) => setPingOnCompletion(event.target.checked)}
+              />
+              Ping on completion
+            </label>
+          </div>
+        )}
       </div>
       <TimeWheel
         now={now}
@@ -401,82 +481,28 @@ const App = () => {
                 Next
               </button>
             </div>
-            <p className="diary-subtle">{getQuote()}</p>
           </header>
 
           {activeTab === "diary" && scheduleMode ? (
-            <section className="schedule-workspace">
-              <div className="schedule-panel-top">
-                <h3>Schedule Day</h3>
-                <button
-                  type="button"
-                  className="diary-nav-btn"
-                  onClick={() => {
-                    setScheduleMode(false);
-                    setActiveScheduleTaskId(null);
-                    setScheduleAnchorMinutes(null);
-                    setScheduleDraftEndMinutes(null);
-                  }}
-                >
-                  Back to Diary
-                </button>
-              </div>
-
-              <div className="schedule-grid">
-                <div className="schedule-task-column">
-                  <p className="schedule-column-title">Unscheduled tasks</p>
-                  <div className="unscheduled-chip-row">
-                    {unscheduledTasks.length ? (
-                      unscheduledTasks.map((task) => (
-                        <button
-                          key={task.id}
-                          type="button"
-                          className={`unscheduled-chip ${task.id === activeScheduleTaskId ? "unscheduled-chip-active" : ""}`}
-                          onClick={() => setTaskAsActiveSchedule(task)}
-                        >
-                          {task.title}
-                        </button>
-                      ))
-                    ) : (
-                      <p className="schedule-empty">All tasks are scheduled for this day.</p>
-                    )}
-                  </div>
-                </div>
-
-                <div className="schedule-form-column">
-                  {activeScheduleTask && scheduleAnchorMinutes !== null && scheduleDraftEndMinutes !== null ? (
-                    <>
-                      <p className="schedule-active-title">{activeScheduleTask.title}</p>
-                      <p className="schedule-preview-line">
-                        Start: {minutesTo12HourTime(scheduleAnchorMinutes)} - End:{" "}
-                        {minutesTo12HourTime(scheduleDraftEndMinutes)}
-                      </p>
-                      <div className="schedule-settings-row schedule-settings-row-compact">
-                        <div className="schedule-settings-inline">
-                          <label>
-                            Reminder Lead
-                            <select
-                              value={scheduleReminderLead}
-                              onChange={(event) => setScheduleReminderLead(event.target.value as ReminderLead)}
-                            >
-                              <option value="5m">5 min before</option>
-                              <option value="10m">10 min before</option>
-                              <option value="15m">15 min before</option>
-                              <option value="30m">30 min before</option>
-                            </select>
-                          </label>
-                        </div>
-                        <button type="button" className="primary-cta schedule-save-btn" onClick={saveActiveSchedule}>
-                          Save Schedule
-                        </button>
-                      </div>
-                    </>
-                  ) : (
-                    <p className="schedule-empty">Select an unscheduled task to begin planning.</p>
-                  )}
-                </div>
-              </div>
-            </section>
+            <SchedulingPanel
+              unscheduledTasks={unscheduledTasks}
+              activeTask={activeScheduleTask}
+              activeTaskId={activeScheduleTaskId}
+              startMinutes={scheduleAnchorMinutes}
+              endMinutes={scheduleDraftEndMinutes}
+              reminderLead={scheduleReminderLead}
+              alarmEnabled={alarmEnabled}
+              onSelectTask={setTaskAsActiveSchedule}
+              onReminderLeadChange={setScheduleReminderLead}
+              onAlarmEnabledChange={setAlarmEnabled}
+              onSave={saveActiveSchedule}
+              onBackToDiary={() => {
+                setScheduleMode(false);
+                setActiveScheduleTaskId(null);
+                setScheduleAnchorMinutes(null);
+                setScheduleDraftEndMinutes(null);
+              }}
+            />
           ) : activeTab === "diary" ? (
             <>
               <TaskComposer
@@ -572,70 +598,11 @@ const App = () => {
                 type="button"
                 className="due-btn"
                 onClick={() => {
-                  syncTasks((prev) =>
-                    prev.map((task) => {
-                      if (task.id !== duePromptTask.id || !task.endTime) return task;
-                      const day = parseISO(task.date);
-                      const [h, m] = task.endTime.split(":").map(Number);
-                      day.setHours(h, m, 0, 0);
-                      const shifted = addMinutes(day, snoozeMinutes);
-                      return {
-                        ...task,
-                        endTime: format(shifted, "HH:mm"),
-                        snoozeCount: (task.snoozeCount ?? 0) + 1,
-                        dueSent: false,
-                        duePromptedAt: undefined,
-                        updatedAt: new Date().toISOString()
-                      };
-                    })
-                  );
                   recordCompletionResponse(duePromptTask, "NO");
                   setDuePromptTaskId(null);
                 }}
               >
-                Snooze
-              </button>
-              <select
-                value={String(snoozeMinutes)}
-                onChange={(event) => setSnoozeMinutes(Number(event.target.value))}
-                className="due-select"
-              >
-                <option value="5">+5m</option>
-                <option value="10">+10m</option>
-                <option value="15">+15m</option>
-                <option value="30">+30m</option>
-              </select>
-            </div>
-            <div className="due-modal-row">
-              <input
-                type="time"
-                value={rescheduleTime}
-                onChange={(event) => setRescheduleTime(event.target.value)}
-                className="due-time"
-              />
-              <button
-                type="button"
-                className="due-btn"
-                onClick={() => {
-                  syncTasks((prev) =>
-                    prev.map((task) =>
-                      task.id === duePromptTask.id
-                        ? {
-                            ...task,
-                            endTime: rescheduleTime,
-                            rescheduleCount: (task.rescheduleCount ?? 0) + 1,
-                            dueSent: false,
-                            duePromptedAt: undefined,
-                            updatedAt: new Date().toISOString()
-                          }
-                        : task
-                    )
-                  );
-                  recordCompletionResponse(duePromptTask, "NO");
-                  setDuePromptTaskId(null);
-                }}
-              >
-                Reschedule
+                No
               </button>
             </div>
           </div>
